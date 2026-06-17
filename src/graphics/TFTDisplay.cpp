@@ -1529,9 +1529,81 @@ void TFTDisplay::flipScreenVertically()
 #endif
 }
 
+#ifdef MERCURIO_V1
+#include <SPI.h>
+extern SPIClass SPI1;
+
+static int16_t xpt2046_read(uint8_t cmd)
+{
+    SPI1.transfer(cmd);
+    int16_t hi = SPI1.transfer(0);
+    int16_t lo = SPI1.transfer(0);
+    return (hi << 5) | (lo >> 3);
+}
+
+static bool mercurio_getTouch(int16_t *x, int16_t *y)
+{
+    SPI1.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(TOUCH_CS, LOW);
+
+    // Read Z pressure first. Z1 is near-zero (~0–50) when nothing is touching
+    // the panel; a real finger press pushes it well above 400. Using only X/Y
+    // range to detect touch lets ADC noise (which falls in-range when untouched)
+    // produce ghost events — that was the "scrolls on its own" bug.
+    int16_t z1 = xpt2046_read(0xB0);
+
+    if (z1 < 400) {
+        digitalWrite(TOUCH_CS, HIGH);
+        SPI1.endTransaction();
+        return false;
+    }
+
+    // Discard first X/Y sample (ADC settling after Z read)
+    xpt2046_read(0x90);
+    xpt2046_read(0xD0);
+
+    const int N = 4;
+    int32_t raw_x = 0, raw_y = 0;
+    for (int i = 0; i < N; i++) {
+        raw_x += xpt2046_read(0x90);
+        raw_y += xpt2046_read(0xD0);
+    }
+    raw_x /= N;
+    raw_y /= N;
+
+    digitalWrite(TOUCH_CS, HIGH);
+    SPI1.endTransaction();
+
+    if (raw_x < 100 || raw_x > 4000 || raw_y < 100 || raw_y > 4000)
+        return false;
+
+    auto mapVal = [](int32_t v, int32_t in_lo, int32_t in_hi, int32_t out_lo, int32_t out_hi) -> int16_t {
+        v = constrain(v, in_lo, in_hi);
+        return (int16_t)((v - in_lo) * (out_hi - out_lo) / (in_hi - in_lo) + out_lo);
+    };
+
+#if TOUCH_SWAP_XY
+    int32_t sx = raw_y, sy = raw_x;
+#else
+    int32_t sx = raw_x, sy = raw_y;
+#endif
+    *x = mapVal(sx, TOUCH_X_MIN, TOUCH_X_MAX, 0, TFT_WIDTH - 1);
+    *y = mapVal(sy, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, TFT_HEIGHT - 1);
+#if TOUCH_INVERT_X
+    *x = (TFT_WIDTH - 1) - *x;
+#endif
+#if TOUCH_INVERT_Y
+    *y = (TFT_HEIGHT - 1) - *y;
+#endif
+    return true;
+}
+#endif // MERCURIO_V1
+
 bool TFTDisplay::hasTouch(void)
 {
 #ifdef RAK14014
+    return true;
+#elif defined(MERCURIO_V1)
     return true;
 #elif !defined(M5STACK) && !defined(HACKADAY_COMMUNICATOR) && !defined(HELTEC_MESH_NODE_T096) && !defined(HELTEC_MESH_NODE_T1)
     return tft->touch() != nullptr;
@@ -1552,6 +1624,8 @@ bool TFTDisplay::getTouch(int16_t *x, int16_t *y)
     } else {
         return false;
     }
+#elif defined(MERCURIO_V1)
+    return mercurio_getTouch(x, y);
 #elif !defined(M5STACK) && !defined(HACKADAY_COMMUNICATOR) && !defined(HELTEC_MESH_NODE_T096) && !defined(HELTEC_MESH_NODE_T1)
     return tft->getTouch(x, y);
 #else
@@ -1612,6 +1686,8 @@ bool TFTDisplay::connect()
     tft->setRotation(2); // T-Watch S3 left-handed orientation
 #elif ARCH_PORTDUINO || defined(SENSECAP_INDICATOR) || defined(T_LORA_PAGER)
     tft->setRotation(0); // use config.yaml to set rotation
+#elif defined(MERCURIO_V1)
+    tft->setRotation(2); // ILI9341 240x320 portrait
 #else
     tft->setRotation(3); // Orient horizontal and wide underneath the silkscreen name label
 #endif
