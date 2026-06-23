@@ -11,6 +11,8 @@
 #define MCP_OLATA  0x14  // port A output latch
 #define MCP_OLATB  0x15  // port B output latch
 #define MCP_IOCON  0x0A  // configuration register
+#define MCP_GPIOA  0x12  // port A input state
+#define MCP_GPIOB  0x13  // port B input state
 
 static void mcp_write(uint8_t reg, uint8_t val)
 {
@@ -18,6 +20,43 @@ static void mcp_write(uint8_t reg, uint8_t val)
     Wire.write(reg);
     Wire.write(val);
     Wire.endTransmission();
+}
+
+static uint8_t mcp_read(uint8_t reg)
+{
+    Wire.beginTransmission(MCP_ADDR);
+    Wire.write(reg);
+    Wire.endTransmission(false); // keep bus active for the read
+    Wire.requestFrom(MCP_ADDR, (uint8_t)1);
+    return Wire.available() ? Wire.read() : 0;
+}
+
+// Toggles MAX98357A AUDIO_EN (MCP23017 GPA5) without disturbing the other
+// OLATA output bits (GPS_RST/DISP_RST/GPS_WKUP), via a read-modify-write
+// since those bits aren't otherwise tracked after earlyInitVariant().
+void mercurio_setAudioEnable(bool on)
+{
+    uint8_t olata = mcp_read(MCP_OLATA);
+    if (on) {
+        olata |= (1 << 5);
+    } else {
+        olata &= ~(1 << 5);
+    }
+    mcp_write(MCP_OLATA, olata);
+}
+
+// SW1 (GPA6) / SW2 (GPB0), both active-LOW with pull-ups (earlyInitVariant).
+// Returns bit0=SW1 pressed, bit1=SW2 pressed.
+uint8_t mercurio_readButtons()
+{
+    uint8_t gpioa = mcp_read(MCP_GPIOA);
+    uint8_t gpiob = mcp_read(MCP_GPIOB);
+    uint8_t result = 0;
+    if (!(gpioa & (1 << 6)))
+        result |= 0x01; // SW1
+    if (!(gpiob & (1 << 0)))
+        result |= 0x02; // SW2
+    return result;
 }
 
 // Called by Meshtastic very early in setup(), before SPI/I2C init.

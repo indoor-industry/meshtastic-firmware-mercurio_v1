@@ -29,6 +29,9 @@ class AudioThread : public concurrency::OSThread
 #ifdef T_LORA_PAGER
         io.digitalWrite(EXPANDS_AMP_EN, HIGH);
 #endif
+#ifdef MERCURIO_V1
+        mercurio_setAudioEnable(true);
+#endif
         setCPUFast(true);
         rtttlFile = std::unique_ptr<AudioFileSourcePROGMEM>(new AudioFileSourcePROGMEM(data, len));
         i2sRtttl = std::unique_ptr<AudioGeneratorRTTTL>(new AudioGeneratorRTTTL());
@@ -57,6 +60,9 @@ class AudioThread : public concurrency::OSThread
 #ifdef T_LORA_PAGER
         io.digitalWrite(EXPANDS_AMP_EN, LOW);
 #endif
+#ifdef MERCURIO_V1
+        mercurio_setAudioEnable(false);
+#endif
     }
 
     void readAloud(const char *text)
@@ -69,11 +75,17 @@ class AudioThread : public concurrency::OSThread
 #ifdef T_LORA_PAGER
         io.digitalWrite(EXPANDS_AMP_EN, HIGH);
 #endif
+#ifdef MERCURIO_V1
+        mercurio_setAudioEnable(true);
+#endif
         auto sam = std::unique_ptr<ESP8266SAM>(new ESP8266SAM);
         sam->Say(audioOut.get(), text);
         setCPUFast(false);
 #ifdef T_LORA_PAGER
         io.digitalWrite(EXPANDS_AMP_EN, LOW);
+#endif
+#ifdef MERCURIO_V1
+        mercurio_setAudioEnable(false);
 #endif
     }
 
@@ -85,6 +97,16 @@ class AudioThread : public concurrency::OSThread
         // if (i2sRtttl != nullptr && i2sRtttl->isRunning()) {
         //     i2sRtttl->loop();
         // }
+#ifdef MERCURIO_V1
+        // SW1/SW2 aren't on free GPIOs (behind the MCP23017), so they're
+        // polled here rather than via a GPIO interrupt. Held-down repeats
+        // naturally at this thread's AUDIO_THREAD_INTERVAL_MS cadence.
+        uint8_t buttons = mercurio_readButtons();
+        if (buttons & 0x01)
+            adjustGain(0.05f);
+        if (buttons & 0x02)
+            adjustGain(-0.05f);
+#endif
         return AUDIO_THREAD_INTERVAL_MS;
     }
 
@@ -93,9 +115,29 @@ class AudioThread : public concurrency::OSThread
     {
         audioOut = std::unique_ptr<AudioOutputI2S>(new AudioOutputI2S(1, AudioOutputI2S::EXTERNAL_I2S));
         audioOut->SetPinout(DAC_I2S_BCK, DAC_I2S_WS, DAC_I2S_DOUT, DAC_I2S_MCLK);
-        audioOut->SetGain(0.2);
+#ifdef MERCURIO_V1
+        // This board's MAX98357A needs the no-delay STAND_MSB I2S format,
+        // not the default STAND_I2S (1-BCLK delay) - see test_firmware/src/audio_i2s.cpp.
+        audioOut->SetLsbJustified(true);
+        // Mono amp: without this, the right I2S slot carries whatever the
+        // (single-channel) TTS/RTTTL source leaves there, which the amp may
+        // mix into the output - audible as distortion/bad quality even
+        // though audio otherwise plays.
+        audioOut->SetOutputModeMono(true);
+#endif
+        audioOut->SetGain(gain);
     };
 
+#ifdef MERCURIO_V1
+    void adjustGain(float delta)
+    {
+        gain = constrain(gain + delta, 0.0f, 1.0f); // 0.0 = mute, holding SW2 down all the way
+        if (audioOut != nullptr)
+            audioOut->SetGain(gain);
+    }
+#endif
+
+    float gain = 0.2f;
     std::unique_ptr<AudioGeneratorRTTTL> i2sRtttl = nullptr;
     std::unique_ptr<AudioOutputI2S> audioOut = nullptr;
 

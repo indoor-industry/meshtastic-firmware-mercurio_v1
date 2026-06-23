@@ -588,6 +588,30 @@ struct SmartPosition PositionModule::getDistanceTraveledSinceLastSend(meshtastic
                          .hasTraveledOverThreshold = distanceTraveled >= distanceTravelThreshold};
 }
 
+// Build a local-only Position packet and hand it straight to sendToPhone(),
+// bypassing the mesh smart-broadcast distance/time gating below entirely.
+// That gating exists to conserve LoRa airtime when telling *other* nodes
+// about our position - it has nothing to do with keeping our own on-device
+// UI (e.g. device-ui's home screen) in sync with our own current GPS
+// status, but until now both consumed the exact same gated packet, so a
+// stationary node's screen would only ever update once (the first lock
+// after boot, since "distance traveled" from the never-set 0,0 default is
+// always huge) and then never again.
+void PositionModule::notifyLocalUIOfPosition(const meshtastic_PositionLite &selfPos)
+{
+    meshtastic_MeshPacket *p = packetPool.allocZeroed();
+    p->from = nodeDB->getNodeNum();
+    p->to = nodeDB->getNodeNum();
+    p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    p->decoded.portnum = meshtastic_PortNum_POSITION_APP;
+
+    meshtastic_Position pos = TypeConversions::ConvertToPosition(selfPos);
+    p->decoded.payload.size =
+        pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_Position_msg, &pos);
+
+    service->sendToPhone(p);
+}
+
 void PositionModule::handleNewPosition()
 {
     const meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(nodeDB->getNodeNum());
@@ -597,6 +621,7 @@ void PositionModule::handleNewPosition()
         meshtastic_PositionLite selfPos;
         if (!nodeDB->copyNodePosition(node->num, selfPos))
             return;
+
         auto smartPosition = getDistanceTraveledSinceLastSend(selfPos);
         uint32_t msSinceLastSend = millis() - lastGpsSend;
         if (smartPosition.hasTraveledOverThreshold &&
@@ -616,6 +641,14 @@ void PositionModule::handleNewPosition()
             lastGpsLatitude = selfPos.latitude_i;
             lastGpsLongitude = selfPos.longitude_i;
         }
+
+        // Must run AFTER sendOurPosition() above: that broadcast's own
+        // ccToPhone side effect sends a privacy-precision-truncated copy
+        // (per channel positionPrecision settings - correct for sharing
+        // with *other* nodes, wrong for our own home screen) to the same
+        // phone/UI queue. Calling this last makes our always-full-precision
+        // update win the race instead of getting overwritten by it.
+        notifyLocalUIOfPosition(selfPos);
     }
 }
 

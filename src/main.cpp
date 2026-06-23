@@ -803,6 +803,17 @@ void setup()
 
     router = new ReliableRouter();
 
+#ifdef HAS_I2S
+    // Must exist before playStartMelody() below: boards with no physical
+    // PWM buzzer (use_i2s_as_buzzer) route all tones through audioThread,
+    // and playTones() silently no-ops if audioThread is null rather than
+    // crashing - so constructing it after the boot melody call meant the
+    // boot melody (and anything else trying to play before this point)
+    // was always silently dropped on such boards.
+    LOG_DEBUG("Start audio thread");
+    audioThread = new AudioThread();
+#endif
+
     // only play start melody when role is not tracker or sensor
     if (config.power.is_power_saving == true &&
         IS_ONE_OF(config.device.role, meshtastic_Config_DeviceConfig_Role_TRACKER,
@@ -973,11 +984,6 @@ void setup()
 #endif
 
     nodeStatus->observe(&nodeDB->newStatus);
-
-#ifdef HAS_I2S
-    LOG_DEBUG("Start audio thread");
-    audioThread = new AudioThread();
-#endif
 
 #ifdef HAS_UDP_MULTICAST
     LOG_DEBUG("Start multicast thread");

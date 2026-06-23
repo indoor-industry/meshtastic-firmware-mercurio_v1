@@ -1,0 +1,400 @@
+MERCURIO V1 — DEBUGGING SESSION REPORT
+Generated 2026-06-23 (covers this session + inferred prior work)
+Board: mercurio_v1, custom ESP32-S3-N16R8 (16MB flash, 8MB octal PSRAM),
+SX1262 LoRa, ILI9341 320x240 TFT + XPT2046 touch, Quectel L76KB-A58 GPS,
+MAX98357A speaker + ICS-43432 mic (mic unused), MCP23017 I/O expander,
+microSD. Fork of meshtastic/firmware, dual-UI build (BaseUI + MUI via
+meshtastic/device-ui).
+
+================================================================================
+PART 1 — WORK FROM BEFORE THIS SESSION (inferred from git log + existing
+uncommitted diffs + memory)
+================================================================================
+
+Per `git log`, the fork was rebased onto upstream meshtastic/firmware and the
+last two commits before this session were:
+  d2d4f6616 "MUI adapted to Mercurio v1"
+  5bb019298 "First working UI for mercurio_v1"
+
+At the start of this session, the working tree already had UNCOMMITTED
+changes (not made this session) to:
+  - src/AudioThread.h            (MERCURIO_V1 audio enable/disable wiring,
+                                   SW1/SW2 button polling skeleton)
+  - variants/esp32s3/mercurio_v1/variant.cpp  (MCP23017 read-modify-write
+                                   helpers: mercurio_setAudioEnable(),
+                                   mercurio_readButtons())
+  - variants/esp32s3/mercurio_v1/variant.h    (HAS_GPS, HAS_I2S + I2S pins,
+                                   SD card pins, button declarations)
+  - variants/esp32s3/mercurio_v1/platformio.ini  (portrait-mode VIEW_240x320
+                                   switch, touch calibration values,
+                                   HAS_SDCARD, ESP8266Audio/ESP8266SAM
+                                   lib_deps, patch_device_ui_portrait.py
+                                   extra_scripts wiring)
+  - variants/esp32s3/mercurio_v1/patch_device_ui_portrait.py (new file, a
+                                   PlatformIO pre-build script)
+
+This prior work (confirmed working per project memory before this session
+began) had already solved, board-specifically:
+  - Landscape→portrait display orientation and touch-axis calibration for
+    this board's panel mounting.
+  - A real device-ui upstream bug where TFTView_320x240::instance() always
+    hardcodes 320x240 dimensions regardless of VIEW_320x240/VIEW_240x320 -
+    patched at build time via patch_device_ui_portrait.py (string-replace
+    on the vendored library, since it's pulled fresh from a zip on every
+    clean build and isn't git-tracked).
+  - SD card sharing the display's SPI bus (same topology as t-deck/
+    tlora-pager - confirmed via memory the fix was just `HAS_SDCARD` alone,
+    no custom SPI driver needed).
+  - Audio/volume-button wiring skeleton (AudioThread.h hooks,
+    mercurio_setAudioEnable/mercurio_readButtons in variant.cpp) - present
+    but, per this session's findings (Part 2), not yet fully working.
+
+This session started with the user reporting 4 issues against that
+baseline: (1) map tiles blank above a certain zoom level via WiFi or SD,
+(2) no way to test audio without receiving a LoRa message, (3) doubts
+about LoRa RX actually working, (4) GPS coordinates stuck at zero on the
+MUI home screen.
+
+================================================================================
+PART 2 — THIS SESSION'S WORK
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1 GPS "stuck at zero" — REAL BUG, FIXED. Upstream-applicable (not
+    mercurio_v1-specific).
+--------------------------------------------------------------------------------
+Symptom: MUI home screen's GPS line never showed real coordinates, always
+"S00°0'00" W00°0'00" 0m", even though the device had a real GPS fix.
+
+Investigation (in order, including two abandoned hypotheses kept for the
+record since the investigative trail is informative):
+
+  a) GPS module/hardware: CONFIRMED FINE, not the cause. Verified via live
+     serial log that the L76KB-A58 gets real fixes (6-12 satellites,
+     cold-start lock time ~9 min then faster on warm boots) under stock
+     Meshtastic firmware, and separately confirmed with the repo's own
+     test_firmware project (a fully separate, simpler PlatformIO project at
+     the repo root, used here purely as an independent hardware reference)
+     getting fast, reliable locks with zero GPS init commands sent.
+
+  b) ABANDONED HYPOTHESIS 1 (board-specific, reverted): Screen.cpp's
+     handleStatusUpdate() was missing a STATUS_TYPE_GPS case (BaseUI only
+     forced a redraw on STATUS_TYPE_POWER, not GPS). This is a real,
+     legitimate small gap in src/graphics/Screen.cpp (upstream-shared
+     code, would affect any board's BaseUI), but it was NOT the cause of
+     the reported symptom (which was on the MUI home screen, a completely
+     different code path) and was reverted at the user's request once the
+     real cause was found.
+
+  c) ABANDONED HYPOTHESIS 2 (would be upstream-applicable if revisited,
+     reverted): src/gps/GPS.cpp sends a "$PCAS11,3" command ("Switch to
+     Vehicle Mode") to L76K/MTK-class GPS modules on init. Measured real
+     before/after evidence that removing it took GPS lock time from
+     repeated 900s failures down to 20-50s successes, on this exact
+     hardware, stationary. This was reverted per explicit user instruction
+     once the actual home-screen bug was found elsewhere (2.1d) and turned
+     out unrelated to the original symptom - but the measurement was real,
+     not a guess. WORTH REVISITING if "GPS won't lock on a stationary
+     mercurio_v1" resurfaces as its own issue; would apply to any
+     GNSS_MODEL_MTK device if confirmed.
+
+  d) ABANDONED HYPOTHESIS 3 (mercurio_v1-specific dead end, reverted):
+     device-ui's TFTView_320x240::updateDisplayConfig() auto-reverts
+     displaymode back to COLOR whenever PacketClient::isStandalone()
+     returns false (which it unconditionally does for this board's
+     connection type) - this blocks switching from MUI to BaseUI via the
+     on-device dialog. Initially suspected as relevant to the GPS bug;
+     turned out irrelevant to GPS, but real and is documented separately
+     in 2.3 below since it has actual user-facing impact for BaseUI/MUI
+     switching - LEFT UNFIXED/REVERTED per user instruction once the
+     simpler underlying navigation issue was found (2.3).
+
+  e) REAL ROOT CAUSE, FIXED, UPSTREAM-APPLICABLE: src/modules/
+     PositionModule.cpp's handleNewPosition() only notifies device-ui's
+     home-screen position label as a side effect of the mesh "smart
+     broadcast" mechanism, which is gated behind the node having moved
+     >100m since its last broadcast. A stationary node's first GPS lock
+     after boot computes a deceptively huge "distance traveled" (measured
+     from the never-initialized 0,0 default), so it broadcasts once - but
+     every subsequent lock, sitting still, never clears that 100m
+     threshold again, so the screen freezes on stale data forever. This
+     is a real architectural bug in PositionModule that conflates "tell
+     the rest of the mesh about my position" (legitimately rate-limited
+     to save LoRa airtime) with "keep my own on-device UI in sync with my
+     own current GPS status" (which has nothing to do with airtime and
+     should never be rate-limited the same way).
+
+     FIX: added PositionModule::notifyLocalUIOfPosition() - builds a
+     local-only decoded Position MeshPacket (addressed to self, never
+     transmitted over the air) and hands it directly to
+     service->sendToPhone(), bypassing the smart-broadcast gate entirely.
+     Called unconditionally on every GPS update inside handleNewPosition(),
+     before the gated mesh-broadcast logic. Confirmed working live on
+     hardware.
+
+     FILES CHANGED (git-tracked, upstream-shared code):
+       src/modules/PositionModule.h   (+1 method declaration)
+       src/modules/PositionModule.cpp (+1 method, +1 call site)
+
+     APPLIES TO: any board running device-ui/MUI that sits stationary -
+     not mercurio_v1-specific at all. Good candidate for an upstream PR to
+     meshtastic/firmware.
+
+--------------------------------------------------------------------------------
+2.2 Map tiles blank above ~zoom 6 / apparent device freeze — REAL BUGS,
+    FIXED. Upstream-applicable (device-ui library, not mercurio_v1-specific).
+--------------------------------------------------------------------------------
+Symptom: map tiles loaded fine from the SD card up to zoom level ~6 (the
+SD card's pre-baked tile pack only goes that deep - confirmed normal/
+expected, not a bug), but zoom levels needing a live WiFi fetch came back
+blank, and heavy use of the map screen sometimes made the whole device
+appear to freeze (no display updates, no touch response) for tens of
+seconds.
+
+Investigation ruled out, in order, with evidence (not guesses):
+  - Low internal heap / TLS handshake memory failure: ruled out by logging
+    free/largest-contiguous internal heap and PSRAM at every failure -
+    saw 45-86KB free internal (no correlation with success/failure) and
+    ~2-3MB free PSRAM already auto-used for large allocations via
+    Arduino-ESP32's built-in heap_caps_malloc_extmem_enable() mechanism.
+  - Google Maps' specific undocumented tile endpoint being the problem:
+    ruled out by adding a second tile-provider entry for OpenStreetMap as
+    an A/B test - it failed identically.
+
+REAL ROOT CAUSE 1: device-ui's URLService::load() (the HTTP(S) tile
+fetcher) called stream->readBytes(buffer, totalLength) exactly ONCE to
+read an entire tile's PNG body. Observed this reliably truncating at a
+fixed ~4113-byte boundary regardless of the tile's actual total size
+(e.g. "4113 != 54917", "4113 != 41408" - same cutoff, different totals),
+consistent with draining only one TLS record/chunk per call rather than
+looping to read the rest of a larger response.
+FIX: replaced the single call with an explicit loop that accumulates
+bytesRead across repeated readBytes() calls until the full content-length
+arrives, or a short (3s) no-progress stall is hit.
+
+REAL ROOT CAUSE 2 (explains the "freeze," same underlying bug, not a
+separate crash): ALL tile loading (SD check -> network fetch -> PNG
+decode) runs synchronously on the single "tft" FreeRTOS task, which holds
+the spiLock mutex for the ENTIRE duration of each call (display + SD
+share one SPI bus on this board). Arduino's default Stream read timeout
+is 1000ms; with a multi-tile batch (observed up to 9+ tiles per view) and
+several tiles each burning close to that timeout before failing, 20-30+
+seconds of the display/touch being fully unresponsive is the expected,
+non-buggy result of the bug above, not a separate hang. Confirmed via two
+separate live JTAG/gdb thread-backtrace captures during a user-reported
+"freeze," both showing every single FreeRTOS task (including "tft") in a
+completely healthy, idle state - proving no deadlock, just a very long
+synchronous blocking call holding a UI-critical lock. (Lesson recorded in
+memory: a gdb snapshot showing "everything idle" does not by itself rule
+out a real perceived hang if the snapshot can land between long
+synchronous calls.)
+FIX: kept the new read loop's stall timeout deliberately short (3s, not
+an initially-tried 10s) specifically because it multiplies across a tile
+batch on this shared-lock architecture.
+
+REAL ROOT CAUSE 3 (a known pre-existing issue, re-confirmed and given a
+real fix this session): with WiFi off/disconnected, lwIP's TCP/IP stack
+is never initialized, and URLService::load() unconditionally tried to
+open an HTTP(S) connection anyway. Before this session's other fixes this
+crashed; after fixing the read loop it instead hung (same spiLock-holding
+problem as above, but now stuck on a connection attempt that can never
+succeed instead of a slow read).
+FIX: added an explicit `if (WiFi.status() != WL_CONNECTED) return false;`
+guard at the very top of URLService::load(), before any connection is
+attempted.
+
+Also (cosmetic/config, not a bug fix): switched the default/first
+TileProvider entry from Google's undocumented mt0.google.com/vt endpoint
+to OpenStreetMap's documented tile.openstreetmap.org service, since both
+work now and OSM is the more appropriate default for a public project.
+
+FILES CHANGED (NOT git-tracked - vendored copy of meshtastic/device-ui,
+pulled via a pinned zip URL in platformio.ini, lives under
+.pio/libdeps/mercurio-v1-tft/meshtastic-device-ui/ and is NOT preserved
+across a clean libdeps wipe or a device-ui version bump):
+  source/graphics/map/URLService.cpp     (read loop, WiFi guard)
+  source/graphics/map/TileProvider.cpp   (provider order/default)
+  source/graphics/map/MapTileSettings.cpp (default index comment only,
+                                            value unchanged at 0)
+
+APPLIES TO: any device-ui/MUI board that fetches map tiles over WiFi -
+not mercurio_v1-specific. The shared-spiLock "freeze" likewise applies to
+any board where the display and SD/network share contention on the same
+task, which is most device-ui boards. Strong candidate for an upstream PR
+- and because it lives in a vendored, non-git-tracked dependency, this
+fix WILL BE LOST on the next clean libdeps wipe or device-ui version bump
+unless upstreamed or turned into a build-time patch script (matching the
+existing patch_device_ui_portrait.py pattern).
+
+--------------------------------------------------------------------------------
+2.3 BaseUI <-> MUI switching - real doc/code mismatch found, no code
+    change made (navigation-only fix). Upstream-applicable (device-ui).
+--------------------------------------------------------------------------------
+meshtastic.org's documentation describes switching from MUI to BaseUI as:
+tap the BT icon in the shutdown menu (enters "Bluetooth Programming Mode"/
+PIN screen) -> long-press the BT icon from THAT screen -> switches to
+BaseUI.
+
+Found by reading device-ui's source that, in this pinned commit, that
+second long-press hits ui_event_BluetoothButton's LONG_PRESSED handler,
+which only disables Bluetooth and reboots - it never touches displaymode,
+so the device reboots right back into MUI. The path that actually works:
+from the shutdown/reboot menu, long-press the BT icon DIRECTLY (skip the
+tap-first step) - this hits a DIFFERENT handler
+(ui_event_device_progmode_button's LONG_PRESSED branch) that opens a
+confirm dialog which actually sets displaymode = DEFAULT and reboots into
+BaseUI correctly.
+
+No source change was needed/made for this - once the correct procedure
+was identified, it just worked. (An unrelated device-ui change attempting
+to "fix" this by disabling updateDisplayConfig()'s COLOR-auto-revert
+logic was tried, found unnecessary once the real procedure was
+discovered, and fully reverted.)
+
+APPLIES TO: any dual-UI device-ui board following the official docs -
+this is a genuine documentation/code mismatch in the meshtastic/device-ui
+project, not mercurio_v1-specific. Worth reporting upstream.
+
+--------------------------------------------------------------------------------
+2.4 Audio test without receiving a LoRa message - found an existing
+    built-in feature, no code change needed for this part.
+--------------------------------------------------------------------------------
+BaseUI (the non-MUI classic menu system) has a hidden "Test Menu",
+unlocked by selecting "Back" 5 times in a row from the System Action
+menu (test_count > 4 sets test_enabled = true in
+src/graphics/draw/MenuHandler.cpp, pre-existing upstream code, not
+modified this session). Once unlocked, "Test Menu" -> "Test Announce"
+calls audioThread->readAloud("This is a test of the emergency broadcast
+system. This is only a test.") directly - exercises the full TTS/I2S
+speaker path with zero LoRa or touch involvement (navigable entirely via
+the board's single physical FLASH/BOOT button: short-press moves the
+menu selection down, long-press confirms/selects).
+
+This led directly to discovering and fixing two REAL, previously-unknown
+audio bugs (2.5), since this was the first time this firmware's audio
+path had ever actually been exercised and listened to.
+
+--------------------------------------------------------------------------------
+2.5 Audio: no sound at all, then "bad quality" - two REAL bugs found and
+    fixed via the above test path.
+--------------------------------------------------------------------------------
+BUG A (no sound at all) - upstream-applicable (ESP8266Audio library type
+bug, not mercurio_v1-specific, though this board is unusually likely to
+trigger it):
+  ESP8266Audio's AudioOutputI2S class declares its mclkPin member as
+  uint8_t, while every other pin field and every setter parameter use
+  `int`. This board legitimately has no MCLK pin (MAX98357A doesn't need
+  one) and so passes -1 ("no MCLK") through SetPinout()'s 4-arg overload.
+  Stored into a uint8_t, -1 silently truncates to 255. ESP-IDF's
+  i2s_set_pin() then rejects 255 as an invalid GPIO and returns an error
+  BEFORE configuring the BCK/WS/DOUT pins at all - meaning the I2S
+  peripheral was never actually wired to its real clock/data lines.
+  Confirmed via serial log: "i2s_check_set_mclk: mck_io_num invalid" /
+  "i2s_set_pin: mclk config failed" on every single attempt to play
+  audio, with zero sound output, before this fix.
+  FIX: changed `uint8_t mclkPin;` to `int mclkPin;` in AudioOutputI2S.h.
+
+  FILE CHANGED (NOT git-tracked - vendored fork of ESP8266Audio, pulled
+  via a pinned zip URL in mercurio_v1's platformio.ini, lives under
+  .pio/libdeps/mercurio-v1-tft/ESP8266Audio/):
+    src/AudioOutputI2S.h
+
+  APPLIES TO: any board using this ESP8266Audio fork with no MCLK pin
+  (mclkPin = -1) - i.e. any I2S DAC/amp that doesn't need a master clock,
+  which is most simple class-D amps like the MAX98357A. Not
+  mercurio_v1-specific, though boards WITH a real MCLK pin (mclkPin >= 0,
+  fits fine in the old uint8_t) would never have hit this.
+
+BUG B (audio played but sounded distorted/bad quality) -
+mercurio_v1-specific (board has a mono amp; this is about correctly
+telling a generic stereo-capable library to fold down to mono, not a bug
+in the library itself):
+  AudioOutputI2S transmits full stereo I2S frames by default
+  (channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT). The MAX98357A on this
+  board is wired mono. Without calling SetOutputModeMono(true), the
+  right-channel slot of every frame carried whatever the (single-channel)
+  TTS/RTTTL generator happened to leave there - likely uninitialized/
+  stale data - which a mono amp wired to mix or select channels could
+  audibly blend into the output as distortion.
+  FIX: added `audioOut->SetOutputModeMono(true);` alongside the existing
+  `SetLsbJustified(true)` call in initOutput().
+
+  FILE CHANGED (git-tracked, mercurio_v1-specific code):
+    src/AudioThread.h (inside an `#ifdef MERCURIO_V1` block)
+
+Also added, mercurio_v1-specific, while testing: lowered the SW2
+volume-down floor from a hardcoded 0.05 to 0.0, so holding the physical
+volume-down button all the way actually reaches true mute instead of
+stopping at a quiet-but-audible floor.
+  FILE CHANGED (git-tracked, mercurio_v1-specific):
+    src/AudioThread.h
+
+--------------------------------------------------------------------------------
+2.6 LoRa RX doubts (original issue 3) - NOT INVESTIGATED this session.
+--------------------------------------------------------------------------------
+The user's original report that they weren't sure LoRa receive was
+working (tried sending from another device, wasn't confident it arrived)
+was never followed up on this session - GPS, maps, and audio consumed the
+full session. Still open.
+
+================================================================================
+PART 3 — SUMMARY TABLE: BOARD-SPECIFIC vs. UPSTREAM-APPLICABLE
+================================================================================
+
+UPSTREAM BUGS (affect meshtastic/firmware and/or meshtastic/device-ui
+generally, not just this board) - FIXED THIS SESSION:
+  1. PositionModule's own-node UI notification incorrectly gated behind
+     the mesh smart-broadcast distance threshold (src/modules/
+     PositionModule.cpp/.h, git-tracked, upstream firmware repo).
+  2. device-ui's URLService::load() single-call readBytes() truncating
+     large tile downloads (vendored device-ui, source/graphics/map/
+     URLService.cpp).
+  3. device-ui's URLService::load() never checking WiFi connectivity
+     before attempting a connection, crashing/hanging with WiFi off
+     (same file as #2).
+  4. ESP8266Audio's AudioOutputI2S::mclkPin being uint8_t instead of a
+     signed type, breaking the -1 "no MCLK" sentinel (vendored
+     ESP8266Audio fork, src/AudioOutputI2S.h).
+
+UPSTREAM DOC/CODE MISMATCH (not a code bug per se, found and worked
+around via correct procedure, no fix needed):
+  5. meshtastic.org's documented BaseUI<->MUI switch procedure doesn't
+     match what device-ui's code actually does in this pinned commit.
+
+UPSTREAM-APPLICABLE BUT REVERTED (real findings, not currently active in
+this codebase - see 2.1b/2.1c for why):
+  6. Screen.cpp's handleStatusUpdate() missing a STATUS_TYPE_GPS case
+     (small legitimate gap, reverted - wasn't the cause of the reported
+     symptom).
+  7. GPS.cpp's "$PCAS11,3" Vehicle Mode command possibly hurting lock
+     reliability on stationary GNSS_MODEL_MTK devices (real measured
+     evidence, reverted per user instruction, kept as a note for if this
+     resurfaces).
+
+BOARD-SPECIFIC (mercurio_v1 only, not upstream bugs):
+  - Original pre-session work: display portrait orientation, touch
+    calibration, SD-card SPI-bus-sharing config, audio/button wiring
+    skeleton (variant.cpp/variant.h/platformio.ini, plus the
+    patch_device_ui_portrait.py build script working around upstream bug
+    #2-style hardcoded-dimensions issue in TFTView_320x240, specific to
+    needing portrait mode on this board's panel).
+  - This session: SetOutputModeMono(true) call and mute-floor change in
+    AudioThread.h - correctly configuring a generic stereo-capable
+    library for THIS board's mono amp; not a library bug.
+  - device-ui's updateDisplayConfig() auto-revert-to-COLOR change
+    (attempted, reverted) - was a dead end specific to how this
+    investigation unfolded, not retained.
+
+================================================================================
+PART 4 — RISK NOTE: VENDORED (NON-GIT-TRACKED) FIXES WILL BE LOST
+================================================================================
+Three of the real fixes above (#2, #3, #4 in Part 3) live in vendored
+dependencies pulled via pinned zip URLs in platformio.ini
+(meshtastic/device-ui and the meshtastic/ESP8266Audio fork), under
+.pio/libdeps/mercurio-v1-tft/. These directories are regenerated from
+scratch on a clean build or a lib_deps version bump and are NOT covered
+by git. Unlike the git-tracked PositionModule fix, these three fixes
+will silently disappear the next time libdeps gets wiped unless they are
+either (a) upstreamed into the respective projects, or (b) converted into
+build-time patch scripts following the existing
+patch_device_ui_portrait.py pattern in this repo.

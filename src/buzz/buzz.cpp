@@ -89,13 +89,18 @@ void playTonesRTTTL(const ToneDuration *tone_durations, int size)
         char noteStr[64];
         snprintf(noteStr, sizeof(noteStr), "%s,%d", note.c_str(), dur);
         strncat(rtttl, noteStr, sizeof(rtttl) - strlen(rtttl) - 1);
-
-        audioThread->beginRttl(rtttl, strlen(rtttl));
-        while (audioThread->isPlaying()) {
-            delay(10);
-        }
-        return;
     }
+
+    audioThread->beginRttl(rtttl, strlen(rtttl));
+    while (audioThread->isPlaying()) {
+        delay(10);
+    }
+    // beginRttl() enables the amp (e.g. mercurio_setAudioEnable(true)) but
+    // nothing disabled it again once playback finished - left the amp
+    // permanently powered after the very first RTTTL-based sound ever
+    // played, making it audibly pick up unrelated electrical noise
+    // (e.g. button presses) as clicks/pops indefinitely afterward.
+    audioThread->stop();
 }
 #endif
 
